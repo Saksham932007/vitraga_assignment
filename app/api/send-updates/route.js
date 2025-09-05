@@ -1,76 +1,71 @@
-// app/api/send-updates/route.js
-import { supabase } from "@/lib/supabase";
-import { NextResponse } from "next/server";
+import { supabase } from "../../../lib/supabase";
 import { Resend } from "resend";
-import { GitHubUpdateEmail } from "@/components/GitHubUpdateEmail";
-import { XMLParser } from "fast-xml-parser";
-import fs from "fs";
+import GitHubUpdateEmail from "../../../components/GitHubUpdateEmail";
+import { promises as fs } from "fs";
 import path from "path";
+import { XMLParser } from "fast-xml-parser";
 
-// This endpoint will be triggered by a cron job.
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 export async function GET(request) {
-  const authHeader = request.headers.get("authorization");
-  if (
-    process.env.CRON_SECRET &&
-    authHeader !== `Bearer ${process.env.CRON_SECRET}`
-  ) {
-    return NextResponse.json(
-      { success: false, message: "Unauthorized" },
-      { status: 401 }
-    );
+  // 1. Check for the cron secret
+  const { searchParams } = new URL(request.url);
+  const secret = searchParams.get("cron_secret");
+
+  if (secret !== process.env.CRON_SECRET) {
+    return new Response("Unauthorized", { status: 401 });
   }
 
-  const resend = new Resend(process.env.RESEND_API_KEY);
-
   try {
-    // 1. Fetch all subscribers from Supabase (same as before)
+    // 2. Fetch all subscribers from Supabase
     const { data: subscribers, error: supabaseError } = await supabase
       .from("subscribers")
       .select("email");
 
-    if (supabaseError) throw supabaseError;
-    if (!subscribers || subscribers.length === 0) {
-      return NextResponse.json({
-        success: true,
-        message: "No subscribers to email.",
+    if (supabaseError) {
+      console.error("Supabase error:", supabaseError);
+      return new Response(JSON.stringify({ error: supabaseError.message }), {
+        status: 500,
       });
     }
 
-    // 2. Fetch data from the local timeline.atom file
-    // The 'path' and 'fs' modules are Node.js APIs for file system operations.
+    if (!subscribers || subscribers.length === 0) {
+      console.log("No subscribers to email.");
+      return new Response(
+        JSON.stringify({ message: "No subscribers to email." }),
+        { status: 200 }
+      );
+    }
+
+    // 3. Fetch and parse the local GitHub timeline data
     const filePath = path.join(process.cwd(), "data", "timeline.atom");
-    const xmlData = fs.readFileSync(filePath, "utf-8");
+    const fileContents = await fs.readFile(filePath, "utf8");
 
-    // 3. Parse the XML data
     const parser = new XMLParser();
-    const parsedData = parser.parse(xmlData);
-    const githubEvents = parsedData.feed.entry;
+    const parsedData = parser.parse(fileContents);
+    const events = parsedData.feed.entry.slice(0, 5); // Get the 5 most recent events
 
-    // 4. Prepare a short update (e.g., last 5 events)
-    const latestEvents = githubEvents.slice(0, 5);
-
-    // 5. Send email to each user (same logic as before)
-    const emailPromises = subscribers.map((subscriber) => {
-      return resend.emails.send({
-        from: "GitHub Updates <updates@yourverifieddomain.com>", // IMPORTANT: Change to your verified Resend domain
+    // 4. Send email to each subscriber
+    for (const subscriber of subscribers) {
+      await resend.emails.send({
+        from: "GitHub Updates <onboarding@resend.dev>",
         to: subscriber.email,
-        subject: "Your Weekly GitHub Timeline Digest",
-        react: GitHubUpdateEmail({ events: latestEvents }),
+        subject: "Your Weekly GitHub Timeline Update",
+        react: GitHubUpdateEmail({ events }),
       });
-    });
+    }
 
-    await Promise.all(emailPromises);
-
-    return NextResponse.json({
-      success: true,
-      message: `Emails sent to ${subscribers.length} subscribers.`,
-    });
-  } catch (error) {
-    console.error("Error in send-updates cron job:", error);
-    return NextResponse.json(
-      { success: false, message: "Internal Server Error" },
-      { status: 500 }
+    console.log(
+      `Successfully sent emails to ${subscribers.length} subscribers.`
     );
+    return new Response(
+      JSON.stringify({ message: "Emails sent successfully!" }),
+      { status: 200 }
+    );
+  } catch (error) {
+    console.error("Error in cron job:", error);
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+    });
   }
 }
